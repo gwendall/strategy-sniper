@@ -7,9 +7,9 @@ import { ethers } from "ethers";
  * RPC_WSS=wss://your-ws-rpc
  * PRIVATE_KEY=0x...
  * FACTORY_ADDRESS=0x...
+ * RANGE_FACTORY_ADDRESS=0x...
  * ROUTER_ADDRESS=0x...           # Uniswap V4 Router (swap executor)
  * POOL_MANAGER_ADDRESS=0x...     # Uniswap V4 Pool Manager (for pool existence check)
- * HOOK_ADDRESS=0x... (optional) # override hook address, otherwise reads from factory
  * ETH_AMOUNT_IN=0.05            # amount of ETH to snipe with (recommended ≤0.05 for fast mode)
  * SNIPE_MODE=fast               # "fast" (max speed, high risk) or "safe" (slower, safer)
  *
@@ -59,7 +59,6 @@ const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS ?? "";
 const RANGE_FACTORY_ADDRESS = process.env.RANGE_FACTORY_ADDRESS ?? "";
 const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS ?? "";
 const POOL_MANAGER_ADDRESS = process.env.POOL_MANAGER_ADDRESS ?? "";
-const HOOK_OVERRIDE = process.env.HOOK_ADDRESS ?? ""; // optional
 const ETH_AMOUNT_IN = process.env.ETH_AMOUNT_IN ?? "0.05"; // default 0.05 ETH
 const SNIPE_MODE = process.env.SNIPE_MODE ?? "fast"; // "fast" or "safe"
 
@@ -94,34 +93,17 @@ async function handleLaunch(
   // console.log("blockNumber:", ev.blockNumber);
   console.log("timestamp:", new Date().toISOString());
 
-  // debug: attach Transfer listener to token (to see incoming tokens)
-  try {
-    const token = new ethers.Contract(nftStrategy, erc20Abi, provider);
-    void token.on("Transfer", (from: string, to: string, value: bigint) => {
-      console.log(`[Token Transfer] from ${from} -> ${to} amount ${value.toString()}`);
-    });
-    console.log("✓ Token Transfer listener attached successfully");
-  } catch (err) {
-    console.error("✗ Failed to attach token Transfer listener:", err);
-    console.error("Transfer listener error details:", {
-      message: err instanceof Error ? err.message : String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-      nftStrategy,
-    });
-  }
-
   // Build deterministic PoolKey as in factory
   console.log("--- Building PoolKey ---");
   let hooks: string;
   try {
-    hooks = HOOK_OVERRIDE || (await getHookAddress()); // <-- uses proper factory
+    hooks = await getHookAddress();
     console.log("✓ Hook address resolved:", hooks);
   } catch (err) {
     console.error("✗ Failed to get hook address:", err);
     console.error("Hook address error details:", {
       message: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
-      HOOK_OVERRIDE,
       factoryAddress: FACTORY_ADDRESS,
     });
     return;
@@ -289,7 +271,6 @@ async function main() {
   console.log("RANGE_FACTORY_ADDRESS:", RANGE_FACTORY_ADDRESS);
   console.log("ROUTER_ADDRESS:", ROUTER_ADDRESS);
   console.log("POOL_MANAGER_ADDRESS:", POOL_MANAGER_ADDRESS);
-  console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
   console.log("ETH_AMOUNT_IN:", ETH_AMOUNT_IN);
   console.log("SNIPE_MODE:", SNIPE_MODE);
   console.log("================================");
@@ -309,7 +290,7 @@ async function main() {
   console.log("Wallet:", wallet.address);
   try {
     // read hookAddress from factory unless overridden
-    const hookAddr = HOOK_OVERRIDE || ((await factory.hookAddress()) as string);
+    const hookAddr = (await factory.hookAddress()) as string;
     console.log("Hook address:", hookAddr);
 
     // quick check: is router whitelisted in factory?
