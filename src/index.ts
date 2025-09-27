@@ -10,7 +10,12 @@ import { ethers } from "ethers";
  * ROUTER_ADDRESS=0x...           # Uniswap V4 Router (swap executor)
  * POOL_MANAGER_ADDRESS=0x...     # Uniswap V4 Pool Manager (for pool existence check)
  * HOOK_ADDRESS=0x... (optional) # override hook address, otherwise reads from factory
- * ETH_AMOUNT_IN=0.05            # amount of ETH to snipe with (as string)
+ * ETH_AMOUNT_IN=0.05            # amount of ETH to snipe with (recommended ≤0.05 for fast mode)
+ * SNIPE_MODE=fast               # "fast" (max speed, high risk) or "safe" (slower, safer)
+ *
+ * Modes:
+ * - fast: No checks, immediate execution, 2x gas price, minOut=0 (⚡ SPEED)
+ * - safe: Pool checks, simulation, slippage protection, longer deadline (🛡️ SAFETY)
  *
  * Install: npm i ethers dotenv
  * Run: npx ts-node src/index.ts
@@ -49,6 +54,7 @@ const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS ?? "";
 const POOL_MANAGER_ADDRESS = process.env.POOL_MANAGER_ADDRESS ?? "";
 const HOOK_OVERRIDE = process.env.HOOK_ADDRESS ?? ""; // optional
 const ETH_AMOUNT_IN = process.env.ETH_AMOUNT_IN ?? "0.05"; // default 0.05 ETH
+const SNIPE_MODE = process.env.SNIPE_MODE ?? "fast"; // "fast" or "safe"
 
 if (!RPC_WSS || !PRIVATE_KEY || !FACTORY_ADDRESS || !ROUTER_ADDRESS || !POOL_MANAGER_ADDRESS) {
   console.error(
@@ -76,6 +82,7 @@ async function main() {
   console.log("POOL_MANAGER_ADDRESS:", POOL_MANAGER_ADDRESS);
   console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
   console.log("ETH_AMOUNT_IN:", ETH_AMOUNT_IN);
+  console.log("SNIPE_MODE:", SNIPE_MODE);
   console.log("================================");
 
   // try {
@@ -180,131 +187,48 @@ async function main() {
 
         console.log("✓ PoolKey built:", poolKey);
 
-        // Check if pool exists before attempting swap
-        console.log("--- Checking Pool Existence ---");
-        try {
-          const slot0 = (await poolManager.getSlot0(poolKey)) as {
-            sqrtPriceX96: bigint;
-            tick: bigint;
-            protocolFee: bigint;
-            lpFee: bigint;
-          };
-          console.log("✓ Pool exists! Slot0:", {
-            sqrtPriceX96: slot0.sqrtPriceX96.toString(),
-            tick: slot0.tick.toString(),
-            protocolFee: slot0.protocolFee.toString(),
-            lpFee: slot0.lpFee.toString(),
-          });
-        } catch (err) {
-          console.error("✗ Pool does not exist or failed to get slot0:", err);
-          console.error("Pool check error details:", {
-            message: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-            poolKey,
-          });
-          console.error("⚠ Skipping swap - pool not found");
-          return;
-        }
-
-        // Prepare swap parameters
-        console.log("--- Preparing Swap Parameters ---");
-        const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
-        const zeroForOne = true; // Always true for ETH -> Token (currency0 -> currency1)
+        // Prepare basic swap parameters
+        const ethIn = ethers.parseEther(ETH_AMOUNT_IN);
+        const zeroForOne = true; // Always true for ETH -> Token
         const hookData = "0x";
         const receiver = wallet.address;
-        const deadline = Math.floor(Date.now() / 1000) + 180; // 3 minutes for production safety
 
-        console.log("✓ Swap direction: ETH (currency0) -> Token (currency1)");
+        // Get dynamic gas pricing
+        console.log("--- Getting Network Fee Data ---");
+        const feeData = await provider.getFeeData();
+        const gasPrice = (feeData.gasPrice ?? ethers.parseUnits("50", "gwei")) * 2n; // 2x base fee for priority
+        console.log(
+          "Network base gas price:",
+          ethers.formatUnits(feeData.gasPrice ?? 0n, "gwei"),
+          "gwei"
+        );
+        console.log("Using priority gas price:", ethers.formatUnits(gasPrice, "gwei"), "gwei");
 
-        // Simulate swap to get expected output and calculate safe minOut
-        console.log("--- Simulating Swap for minOut Calculation ---");
-        let minOut = 0n;
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-          const result = await router.swapExactTokensForTokens.staticCall(
-            ethIn,
-            0, // simulate with 0 minOut first
-            zeroForOne,
-            poolKey,
-            hookData,
-            receiver,
-            deadline,
-            { value: ethIn }
-          );
+        if (SNIPE_MODE === "safe") {
+          console.log("🛡️ SAFE MODE: Running checks and simulation for safer sniping");
 
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-          const amount0Delta = result[0] as bigint;
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-          const amount1Delta = result[1] as bigint;
-
-          console.log("Swap simulation result:", {
-            amount0Delta: amount0Delta.toString(),
-            amount1Delta: amount1Delta.toString(),
-          });
-
-          // For ETH -> Token swap (zeroForOne = true):
-          // amount0Delta = negative (ETH out)
-          // amount1Delta = positive (tokens in)
-          const tokensOut = amount1Delta > 0 ? amount1Delta : -amount1Delta;
-          minOut = (tokensOut * 90n) / 100n; // 10% slippage tolerance
-
-          console.log("✓ Calculated minOut with 10% slippage:", minOut.toString());
-        } catch (simErr) {
-          console.warn(
-            "⚠ Swap simulation failed, using minOut = 0 (no slippage protection):",
-            simErr instanceof Error ? simErr.message : String(simErr)
-          );
-          minOut = 0n;
-        }
-
-        // Gas params - tune as needed
-        const overrides = {
-          value: ethIn,
-          gasLimit: 1_200_000,
-          // gasPrice: ethers.parseUnits("200", "gwei"), // optional: set explicit gas price if legacy RPC
-        };
-
-        console.log("Swap parameters:", {
-          ethIn: ethIn.toString(),
-          ethInEther: ETH_AMOUNT_IN,
-          minOut: minOut.toString(),
-          zeroForOne,
-          receiver,
-          deadline,
-          overrides,
-          routerAddress: ROUTER_ADDRESS,
-        });
-
-        // Check wallet balance before swap
-        try {
-          const balance = await provider.getBalance(wallet.address);
-          console.log("Wallet ETH balance:", ethers.formatEther(balance), "ETH");
-          if (balance < ethIn) {
-            console.error("✗ Insufficient ETH balance!");
-            console.error("Required:", ethers.formatEther(ethIn), "ETH");
-            console.error("Available:", ethers.formatEther(balance), "ETH");
+          // Safe mode: Check pool exists
+          try {
+            const slot0 = (await poolManager.getSlot0(poolKey)) as {
+              sqrtPriceX96: bigint;
+              tick: bigint;
+              protocolFee: bigint;
+              lpFee: bigint;
+            };
+            console.log("✓ Pool exists! Price:", slot0.sqrtPriceX96.toString());
+          } catch (err: unknown) {
+            console.error("✗ Pool does not exist, skipping swap", err);
             return;
           }
-        } catch (err) {
-          console.error("✗ Failed to check wallet balance:", err);
-          console.error("Balance check error details:", {
-            message: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-            walletAddress: wallet.address,
-          });
-        }
 
-        console.log(`--- Executing Swap ---`);
-        console.log(
-          `Attempting swap: send ${ETH_AMOUNT_IN} ETH -> token ${nftStrategy} via router ${ROUTER_ADDRESS}`
-        );
-
-        try {
-          // Get gas estimate first (correct ethers v6 syntax)
+          // Safe mode: Simulate swap for minOut
+          let minOut = 0n;
+          const deadline = Math.floor(Date.now() / 1000) + 180; // Longer deadline
           try {
-            const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+            const result = await router.swapExactTokensForTokens.staticCall(
               ethIn,
-              minOut,
+              0,
               zeroForOne,
               poolKey,
               hookData,
@@ -312,115 +236,88 @@ async function main() {
               deadline,
               { value: ethIn }
             );
-            console.log("✓ Gas estimate:", gasEstimate.toString());
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+            const amount1Delta = result[1] as bigint;
+            const tokensOut = amount1Delta > 0 ? amount1Delta : -amount1Delta;
+            minOut = (tokensOut * 90n) / 100n; // 10% slippage
+            console.log("✓ Simulated minOut with 10% slippage:", minOut.toString());
+          } catch {
+            console.warn("⚠ Simulation failed, using minOut = 0");
+          }
 
-            // Update gas limit based on estimate with 20% buffer
-            overrides.gasLimit = Number((gasEstimate * 120n) / 100n);
-            console.log("Updated gas limit with 20% buffer:", overrides.gasLimit.toString());
-          } catch (gasErr) {
+          const overrides = {
+            value: ethIn,
+            gasLimit: 1_500_000,
+            gasPrice,
+          };
+
+          console.log(`🛡️ SAFE SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
+
+          try {
+            const tx = (await router.swapExactTokensForTokens(
+              ethIn,
+              minOut,
+              zeroForOne,
+              poolKey,
+              hookData,
+              receiver,
+              deadline,
+              overrides
+            )) as ethers.TransactionResponse;
+
+            console.log("✓ Safe swap tx submitted:", tx.hash);
+            const receipt = await tx.wait();
+            if (receipt) {
+              console.log("✓ Safe swap confirmed! Block:", receipt.blockNumber);
+            }
+          } catch (err) {
+            console.error("✗ Safe swap failed:", err instanceof Error ? err.message : String(err));
+          }
+        } else {
+          console.log("🚀 FAST MODE: Maximum speed sniping (high risk)");
+
+          // Validate ETH amount for fast mode
+          const ethAmount = parseFloat(ETH_AMOUNT_IN);
+          if (ethAmount > 0.1) {
             console.warn(
-              "⚠ Gas estimation failed (proceeding with default gas limit):",
-              gasErr instanceof Error ? gasErr.message : String(gasErr)
+              `⚠️ WARNING: Using ${ETH_AMOUNT_IN} ETH in FAST mode (no slippage protection)`
+            );
+            console.warn(
+              "💡 Consider using smaller amounts (≤0.05 ETH) or SAFE mode for larger amounts"
             );
           }
 
-          const tx = (await router.swapExactTokensForTokens(
-            ethIn,
-            minOut,
-            zeroForOne,
-            poolKey,
-            hookData,
-            receiver,
-            deadline,
-            overrides
-          )) as ethers.TransactionResponse;
+          const minOut = 0n; // Accept any amount for max speed
+          const deadline = Math.floor(Date.now() / 1000) + 60; // Short deadline
 
-          console.log("✓ Swap tx submitted:", tx.hash);
-          console.log("Transaction details:", {
-            hash: tx.hash,
-            from: tx.from,
-            to: tx.to,
-            value: tx.value?.toString(),
-            gasLimit: tx.gasLimit?.toString(),
-            gasPrice: tx.gasPrice?.toString(),
-            nonce: tx.nonce,
-          });
+          const overrides = {
+            value: ethIn,
+            gasLimit: 2_000_000, // High gas limit to avoid failures
+            gasPrice, // Dynamic priority pricing
+          };
 
-          console.log("Waiting for transaction confirmation...");
-          const receipt = await tx.wait();
-          if (!receipt) {
-            console.error("✗ Transaction receipt is null");
-            return;
-          }
+          console.log(`🚀 FAST SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
 
-          console.log("✓ Swap confirmed!");
-          console.log("Receipt details:", {
-            blockNumber: receipt.blockNumber,
-            blockHash: receipt.blockHash,
-            gasUsed: receipt.gasUsed?.toString(),
-            status: receipt.status,
-            logs: receipt.logs.length,
-          });
-
-          // Parse the return value from the transaction logs to see actual swap amounts
           try {
-            // Look for the Swap event or similar in the logs to get actual amounts
-            // For now, just log that the swap succeeded
-            console.log("🎉 Sniping successful! Tokens acquired.");
+            const tx = (await router.swapExactTokensForTokens(
+              ethIn,
+              minOut,
+              zeroForOne,
+              poolKey,
+              hookData,
+              receiver,
+              deadline,
+              overrides
+            )) as ethers.TransactionResponse;
 
-            // Calculate gas cost
-            if (receipt.gasUsed && tx.gasPrice) {
-              const gasCost = receipt.gasUsed * tx.gasPrice;
-              console.log("Gas cost:", ethers.formatEther(gasCost), "ETH");
+            console.log("🚀 Fast swap tx submitted:", tx.hash);
+            const receipt = await tx.wait();
+            if (receipt) {
+              console.log("🎉 Fast swap confirmed! Block:", receipt.blockNumber);
             }
-          } catch (parseErr) {
-            console.warn("Could not parse swap results from logs:", parseErr);
+          } catch (err) {
+            console.error("✗ Fast swap failed:", err instanceof Error ? err.message : String(err));
           }
-
-          // Log any events in the receipt
-          if (receipt.logs.length > 0) {
-            console.log("Transaction logs:");
-            receipt.logs.forEach((log, index) => {
-              console.log(`Log ${index}:`, {
-                address: log.address,
-                topics: log.topics,
-                data: log.data,
-              });
-            });
-          }
-        } catch (err) {
-          console.error("✗ Swap failed!");
-          console.error("Error message:", err instanceof Error ? err.message : String(err));
-          console.error("Error stack:", err instanceof Error ? err.stack : undefined);
-
-          // Log additional error context
-          if (err instanceof Error) {
-            const errorDetails: Record<string, unknown> = {
-              name: err.name,
-              message: err.message,
-            };
-
-            if ("code" in err) errorDetails.code = err.code;
-            if ("reason" in err) errorDetails.reason = err.reason;
-            if ("transaction" in err) errorDetails.transaction = err.transaction;
-            if ("receipt" in err) errorDetails.receipt = err.receipt;
-
-            console.error("Error details:", errorDetails);
-          }
-
-          console.error("Swap context when error occurred:", {
-            ethIn: ethIn.toString(),
-            minOut: minOut.toString(),
-            zeroForOne,
-            poolKey,
-            hookData,
-            receiver,
-            deadline,
-            overrides,
-            routerAddress: ROUTER_ADDRESS,
-            walletAddress: wallet.address,
-            timestamp: new Date().toISOString(),
-          });
         }
 
         console.log("=== NFTStrategyLaunched END ===");
