@@ -3,16 +3,17 @@ import "dotenv/config";
 import { ethers } from "ethers";
 
 /**
- * Prérequis .env :
+ * Required .env variables:
  * RPC_WSS=wss://your-ws-rpc
  * PRIVATE_KEY=0x...
  * FACTORY_ADDRESS=0x...
- * ROUTER_ADDRESS=0x...        # Uniswap V4 Router (swap executor)
- * HOOK_ADDRESS=0x... (optionnel) # si tu veux override, sinon on lit factory.hookAddress()
- * ETH_AMOUNT_IN=0.05          # combien d'ETH en string
+ * ROUTER_ADDRESS=0x...           # Uniswap V4 Router (swap executor)
+ * POOL_MANAGER_ADDRESS=0x...     # Uniswap V4 Pool Manager (for pool existence check)
+ * HOOK_ADDRESS=0x... (optional) # override hook address, otherwise reads from factory
+ * ETH_AMOUNT_IN=0.05            # amount of ETH to snipe with (as string)
  *
- * Installer : npm i ethers dotenv
- * Lancer : npx ts-node snipe-bot.ts
+ * Install: npm i ethers dotenv
+ * Run: npx ts-node src/index.ts
  */
 
 // ----------------- Minimal ABIs ----------------- //
@@ -22,6 +23,11 @@ const factoryAbi = [
   "event NFTStrategyLaunched(address indexed collection, address indexed nftStrategy, string tokenName, string tokenSymbol)",
   "function hookAddress() view returns (address)",
   "function listOfRouters(address) view returns (bool)",
+];
+
+// Pool Manager ABI for checking pool existence
+const poolManagerAbi = [
+  "function getSlot0(tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
 ];
 
 // Router ABI matching the actual contract interface
@@ -40,12 +46,13 @@ const RPC_WSS = process.env.RPC_WSS ?? "";
 const PRIVATE_KEY = process.env.PRIVATE_KEY ?? "";
 const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS ?? "";
 const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS ?? "";
+const POOL_MANAGER_ADDRESS = process.env.POOL_MANAGER_ADDRESS ?? "";
 const HOOK_OVERRIDE = process.env.HOOK_ADDRESS ?? ""; // optional
 const ETH_AMOUNT_IN = process.env.ETH_AMOUNT_IN ?? "0.05"; // default 0.05 ETH
 
-if (!RPC_WSS || !PRIVATE_KEY || !FACTORY_ADDRESS || !ROUTER_ADDRESS) {
+if (!RPC_WSS || !PRIVATE_KEY || !FACTORY_ADDRESS || !ROUTER_ADDRESS || !POOL_MANAGER_ADDRESS) {
   console.error(
-    "Missing env vars. Required: RPC_WSS, PRIVATE_KEY, FACTORY_ADDRESS, ROUTER_ADDRESS"
+    "Missing env vars. Required: RPC_WSS, PRIVATE_KEY, FACTORY_ADDRESS, ROUTER_ADDRESS, POOL_MANAGER_ADDRESS"
   );
   process.exit(1);
 }
@@ -54,7 +61,8 @@ if (!RPC_WSS || !PRIVATE_KEY || !FACTORY_ADDRESS || !ROUTER_ADDRESS) {
 const provider = new ethers.WebSocketProvider(RPC_WSS);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 const factory = new ethers.Contract(FACTORY_ADDRESS, factoryAbi, provider);
-const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, wallet); // Reserved for future swap implementation
+const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, wallet);
+const poolManager = new ethers.Contract(POOL_MANAGER_ADDRESS, poolManagerAbi, provider);
 
 async function main() {
   console.log("=== Script Launch Parameters ===");
@@ -65,6 +73,7 @@ async function main() {
   );
   console.log("FACTORY_ADDRESS:", FACTORY_ADDRESS);
   console.log("ROUTER_ADDRESS:", ROUTER_ADDRESS);
+  console.log("POOL_MANAGER_ADDRESS:", POOL_MANAGER_ADDRESS);
   console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
   console.log("ETH_AMOUNT_IN:", ETH_AMOUNT_IN);
   console.log("================================");
@@ -152,13 +161,12 @@ async function main() {
           return;
         }
 
-        // PoolKey(currency0, currency1, fee, tickSpacing, hooks)
-        // CRITICAL: Currencies must be ordered by address value (currency0 < currency1)
-        const ethAddress = ethers.ZeroAddress;
-        const tokenAddress = nftStrategy;
-
-        const currency0 = ethAddress < tokenAddress ? ethAddress : tokenAddress;
-        const currency1 = ethAddress < tokenAddress ? tokenAddress : ethAddress;
+        // PoolKey construction for ETH -> Token sniping
+        // Since we're always trading ETH (0x0) -> Token, and 0x0 < any token address:
+        // currency0 = ETH, currency1 = Token, zeroForOne = true
+        console.log("--- Building PoolKey for ETH -> Token ---");
+        const currency0 = ethers.ZeroAddress; // ETH (always currency0 since 0x0 < any address)
+        const currency1 = nftStrategy; // Token (always currency1)
         const fee = 0; // uint24
         const tickSpacing = 60; // int24
 
@@ -171,18 +179,43 @@ async function main() {
         };
 
         console.log("✓ PoolKey built:", poolKey);
-        console.log("Currency ordering:", { ethAddress, tokenAddress, currency0, currency1 });
+
+        // Check if pool exists before attempting swap
+        console.log("--- Checking Pool Existence ---");
+        try {
+          const slot0 = (await poolManager.getSlot0(poolKey)) as {
+            sqrtPriceX96: bigint;
+            tick: bigint;
+            protocolFee: bigint;
+            lpFee: bigint;
+          };
+          console.log("✓ Pool exists! Slot0:", {
+            sqrtPriceX96: slot0.sqrtPriceX96.toString(),
+            tick: slot0.tick.toString(),
+            protocolFee: slot0.protocolFee.toString(),
+            lpFee: slot0.lpFee.toString(),
+          });
+        } catch (err) {
+          console.error("✗ Pool does not exist or failed to get slot0:", err);
+          console.error("Pool check error details:", {
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+            poolKey,
+          });
+          console.error("⚠ Skipping swap - pool not found");
+          return;
+        }
 
         // Prepare swap parameters
         console.log("--- Preparing Swap Parameters ---");
         const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
         const minOut = 0; // set to 0 for max agressivity; you can compute via quoter for safety
-        const zeroForOne = ethAddress === currency0; // true if swapping currency0 -> currency1
+        const zeroForOne = true; // Always true for ETH -> Token (currency0 -> currency1)
         const hookData = "0x";
         const receiver = wallet.address;
         const deadline = Math.floor(Date.now() / 1000) + 60; // 60 sec
 
-        console.log("Swap direction:", { zeroForOne, swapping: zeroForOne ? "currency0 -> currency1" : "currency1 -> currency0" });
+        console.log("✓ Swap direction: ETH (currency0) -> Token (currency1)");
 
         // Gas params - tune as needed
         const overrides = {
