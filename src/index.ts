@@ -153,8 +153,12 @@ async function main() {
         }
 
         // PoolKey(currency0, currency1, fee, tickSpacing, hooks)
-        const currency0 = ethers.ZeroAddress; // ETH
-        const currency1 = nftStrategy;
+        // CRITICAL: Currencies must be ordered by address value (currency0 < currency1)
+        const ethAddress = ethers.ZeroAddress;
+        const tokenAddress = nftStrategy;
+
+        const currency0 = ethAddress < tokenAddress ? ethAddress : tokenAddress;
+        const currency1 = ethAddress < tokenAddress ? tokenAddress : ethAddress;
         const fee = 0; // uint24
         const tickSpacing = 60; // int24
 
@@ -167,15 +171,18 @@ async function main() {
         };
 
         console.log("✓ PoolKey built:", poolKey);
+        console.log("Currency ordering:", { ethAddress, tokenAddress, currency0, currency1 });
 
         // Prepare swap parameters
         console.log("--- Preparing Swap Parameters ---");
         const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
         const minOut = 0; // set to 0 for max agressivity; you can compute via quoter for safety
-        const zeroForOne = true; // ETH (currency0) -> token (currency1)
+        const zeroForOne = ethAddress === currency0; // true if swapping currency0 -> currency1
         const hookData = "0x";
         const receiver = wallet.address;
         const deadline = Math.floor(Date.now() / 1000) + 60; // 60 sec
+
+        console.log("Swap direction:", { zeroForOne, swapping: zeroForOne ? "currency0 -> currency1" : "currency1 -> currency0" });
 
         // Gas params - tune as needed
         const overrides = {
