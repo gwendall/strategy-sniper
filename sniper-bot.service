@@ -1,0 +1,17 @@
+[Unit]
+Description=NFT Strategy Sniper Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/strategy-sniper
+ExecStart=/usr/bin/node /home/ubuntu/strategy-sniper/dist/index.js
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/sniper-bot.log
+StandardError=append:/var/log/sniper-bot-error.log
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
