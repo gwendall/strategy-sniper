@@ -58,6 +58,26 @@ const factory = new ethers.Contract(FACTORY_ADDRESS, factoryAbi, provider);
 const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, wallet); // Reserved for future swap implementation
 
 async function main() {
+  console.log("=== Script Launch Parameters ===");
+  console.log("RPC_WSS:", RPC_WSS);
+  console.log("PRIVATE_KEY:", PRIVATE_KEY ? `${PRIVATE_KEY.slice(0, 6)}...${PRIVATE_KEY.slice(-4)}` : "Not set");
+  console.log("FACTORY_ADDRESS:", FACTORY_ADDRESS);
+  console.log("ROUTER_ADDRESS:", ROUTER_ADDRESS);
+  console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
+  console.log("ETH_AMOUNT_IN:", ETH_AMOUNT_IN);
+  console.log("================================");
+
+  // try {
+  //   console.log("Listening for Meebit Token Transfer events...");
+  //   const meebitStrategy = "0xC9b2c00f31B210FCea1242D91307A5B1e3b2Be68";
+  //   const meebitToken = new ethers.Contract(meebitStrategy, erc20Abi, provider);
+  //   void meebitToken.on("Transfer", (from: string, to: string, value: bigint) => {
+  //     console.log(`[Meebit Token Transfer] from ${from} -> ${to} amount ${value.toString()}`);
+  //   });
+  // } catch (err) {
+  //   console.warn("Could not attach Meebit Token Transfer listener:", err);
+  // }
+
   console.log("Connected to provider:", await provider.getNetwork().then((n) => n.name));
   console.log("Wallet:", wallet.address);
   try {
