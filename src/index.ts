@@ -209,13 +209,53 @@ async function main() {
         // Prepare swap parameters
         console.log("--- Preparing Swap Parameters ---");
         const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
-        const minOut = 0; // set to 0 for max agressivity; you can compute via quoter for safety
         const zeroForOne = true; // Always true for ETH -> Token (currency0 -> currency1)
         const hookData = "0x";
         const receiver = wallet.address;
-        const deadline = Math.floor(Date.now() / 1000) + 60; // 60 sec
+        const deadline = Math.floor(Date.now() / 1000) + 180; // 3 minutes for production safety
 
         console.log("✓ Swap direction: ETH (currency0) -> Token (currency1)");
+
+        // Simulate swap to get expected output and calculate safe minOut
+        console.log("--- Simulating Swap for minOut Calculation ---");
+        let minOut = 0n;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          const result = await router.swapExactTokensForTokens.staticCall(
+            ethIn,
+            0, // simulate with 0 minOut first
+            zeroForOne,
+            poolKey,
+            hookData,
+            receiver,
+            deadline,
+            { value: ethIn }
+          );
+
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+          const amount0Delta = result[0] as bigint;
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+          const amount1Delta = result[1] as bigint;
+
+          console.log("Swap simulation result:", {
+            amount0Delta: amount0Delta.toString(),
+            amount1Delta: amount1Delta.toString(),
+          });
+
+          // For ETH -> Token swap (zeroForOne = true):
+          // amount0Delta = negative (ETH out)
+          // amount1Delta = positive (tokens in)
+          const tokensOut = amount1Delta > 0 ? amount1Delta : -amount1Delta;
+          minOut = (tokensOut * 90n) / 100n; // 10% slippage tolerance
+
+          console.log("✓ Calculated minOut with 10% slippage:", minOut.toString());
+        } catch (simErr) {
+          console.warn(
+            "⚠ Swap simulation failed, using minOut = 0 (no slippage protection):",
+            simErr instanceof Error ? simErr.message : String(simErr)
+          );
+          minOut = 0n;
+        }
 
         // Gas params - tune as needed
         const overrides = {
@@ -227,7 +267,7 @@ async function main() {
         console.log("Swap parameters:", {
           ethIn: ethIn.toString(),
           ethInEther: ETH_AMOUNT_IN,
-          minOut,
+          minOut: minOut.toString(),
           zeroForOne,
           receiver,
           deadline,
@@ -260,7 +300,7 @@ async function main() {
         );
 
         try {
-          // Get gas estimate first
+          // Get gas estimate first (correct ethers v6 syntax)
           try {
             const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
               ethIn,
@@ -270,12 +310,16 @@ async function main() {
               hookData,
               receiver,
               deadline,
-              overrides
+              { value: ethIn }
             );
             console.log("✓ Gas estimate:", gasEstimate.toString());
+
+            // Update gas limit based on estimate with 20% buffer
+            overrides.gasLimit = Number((gasEstimate * 120n) / 100n);
+            console.log("Updated gas limit with 20% buffer:", overrides.gasLimit.toString());
           } catch (gasErr) {
             console.warn(
-              "⚠ Gas estimation failed (proceeding anyway):",
+              "⚠ Gas estimation failed (proceeding with default gas limit):",
               gasErr instanceof Error ? gasErr.message : String(gasErr)
             );
           }
@@ -318,6 +362,21 @@ async function main() {
             logs: receipt.logs.length,
           });
 
+          // Parse the return value from the transaction logs to see actual swap amounts
+          try {
+            // Look for the Swap event or similar in the logs to get actual amounts
+            // For now, just log that the swap succeeded
+            console.log("🎉 Sniping successful! Tokens acquired.");
+
+            // Calculate gas cost
+            if (receipt.gasUsed && tx.gasPrice) {
+              const gasCost = receipt.gasUsed * tx.gasPrice;
+              console.log("Gas cost:", ethers.formatEther(gasCost), "ETH");
+            }
+          } catch (parseErr) {
+            console.warn("Could not parse swap results from logs:", parseErr);
+          }
+
           // Log any events in the receipt
           if (receipt.logs.length > 0) {
             console.log("Transaction logs:");
@@ -351,7 +410,7 @@ async function main() {
 
           console.error("Swap context when error occurred:", {
             ethIn: ethIn.toString(),
-            minOut,
+            minOut: minOut.toString(),
             zeroForOne,
             poolKey,
             hookData,
