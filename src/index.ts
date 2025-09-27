@@ -46,12 +46,6 @@ const routerAbi = [
   "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, bool zeroForOne, tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes hookData, address receiver, uint256 deadline) payable returns (tuple(int128 amount0, int128 amount1))",
 ];
 
-// ERC20 minimal for Transfer event
-const erc20Abi = [
-  "event Transfer(address indexed from, address indexed to, uint256 value)",
-  "function decimals() view returns (uint8)",
-];
-
 // ----------------- Config / env ----------------- //
 const RPC_WSS = process.env.RPC_WSS ?? "";
 const PRIVATE_KEY = process.env.PRIVATE_KEY ?? "";
