@@ -24,8 +24,14 @@ import { ethers } from "ethers";
 // ----------------- Minimal ABIs ----------------- //
 // Factory ABI: we only need NFTStrategyLaunched event, hookAddress(), listOfRouters()
 const factoryAbi = [
-  // event NFTStrategyLaunched(address indexed collection, address indexed nftStrategy, string tokenName, string tokenSymbol);
   "event NFTStrategyLaunched(address indexed collection, address indexed nftStrategy, string tokenName, string tokenSymbol)",
+  "function hookAddress() view returns (address)",
+  "function listOfRouters(address) view returns (bool)",
+];
+
+// Additional ABI for Range factory
+const rangeFactoryAbi = [
+  "event NFTStrategyRangeLaunched(address indexed collection, address indexed nftStrategy, uint256 lowTokenId, uint256 highTokenId, string tokenName, string tokenSymbol)",
   "function hookAddress() view returns (address)",
   "function listOfRouters(address) view returns (bool)",
 ];
@@ -50,6 +56,7 @@ const erc20Abi = [
 const RPC_WSS = process.env.RPC_WSS ?? "";
 const PRIVATE_KEY = process.env.PRIVATE_KEY ?? "";
 const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS ?? "";
+const RANGE_FACTORY_ADDRESS = process.env.RANGE_FACTORY_ADDRESS ?? "";
 const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS ?? "";
 const POOL_MANAGER_ADDRESS = process.env.POOL_MANAGER_ADDRESS ?? "";
 const HOOK_OVERRIDE = process.env.HOOK_ADDRESS ?? ""; // optional
@@ -67,8 +74,209 @@ if (!RPC_WSS || !PRIVATE_KEY || !FACTORY_ADDRESS || !ROUTER_ADDRESS || !POOL_MAN
 const provider = new ethers.WebSocketProvider(RPC_WSS);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 const factory = new ethers.Contract(FACTORY_ADDRESS, factoryAbi, provider);
+const rangeFactory = new ethers.Contract(RANGE_FACTORY_ADDRESS, rangeFactoryAbi, provider);
 const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, wallet);
 const poolManager = new ethers.Contract(POOL_MANAGER_ADDRESS, poolManagerAbi, provider);
+
+// Shared handler
+async function handleLaunch(
+  nftStrategy: string,
+  tokenName: string,
+  tokenSymbol: string,
+  getHookAddress: () => Promise<string>
+) {
+  console.log("🚀 New token launch detected:", nftStrategy, tokenName, tokenSymbol);
+  console.log("=== NFTStrategyLaunched ===");
+  // console.log("collection:", collection);
+  console.log("token (nftStrategy):", nftStrategy);
+  console.log("name / symb:", tokenName, tokenSymbol);
+  // console.log("txHash:", ev.transactionHash);
+  // console.log("blockNumber:", ev.blockNumber);
+  console.log("timestamp:", new Date().toISOString());
+
+  // debug: attach Transfer listener to token (to see incoming tokens)
+  try {
+    const token = new ethers.Contract(nftStrategy, erc20Abi, provider);
+    void token.on("Transfer", (from: string, to: string, value: bigint) => {
+      console.log(`[Token Transfer] from ${from} -> ${to} amount ${value.toString()}`);
+    });
+    console.log("✓ Token Transfer listener attached successfully");
+  } catch (err) {
+    console.error("✗ Failed to attach token Transfer listener:", err);
+    console.error("Transfer listener error details:", {
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      nftStrategy,
+    });
+  }
+
+  // Build deterministic PoolKey as in factory
+  console.log("--- Building PoolKey ---");
+  let hooks: string;
+  try {
+    hooks = HOOK_OVERRIDE || (await getHookAddress()); // <-- uses proper factory
+    console.log("✓ Hook address resolved:", hooks);
+  } catch (err) {
+    console.error("✗ Failed to get hook address:", err);
+    console.error("Hook address error details:", {
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+      HOOK_OVERRIDE,
+      factoryAddress: FACTORY_ADDRESS,
+    });
+    return;
+  }
+
+  // PoolKey construction for ETH -> Token sniping
+  // Since we're always trading ETH (0x0) -> Token, and 0x0 < any token address:
+  // currency0 = ETH, currency1 = Token, zeroForOne = true
+  console.log("--- Building PoolKey for ETH -> Token ---");
+  const currency0 = ethers.ZeroAddress; // ETH (always currency0 since 0x0 < any address)
+  const currency1 = nftStrategy; // Token (always currency1)
+  const fee = 0; // uint24
+  const tickSpacing = 60; // int24
+
+  const poolKey = {
+    currency0,
+    currency1,
+    fee,
+    tickSpacing,
+    hooks,
+  };
+
+  console.log("✓ PoolKey built:", poolKey);
+
+  // Prepare basic swap parameters
+  const ethIn = ethers.parseEther(ETH_AMOUNT_IN);
+  const zeroForOne = true; // Always true for ETH -> Token
+  const hookData = "0x";
+  const receiver = wallet.address;
+
+  // Get dynamic gas pricing
+  console.log("--- Getting Network Fee Data ---");
+  const feeData = await provider.getFeeData();
+  const gasPrice = (feeData.gasPrice ?? ethers.parseUnits("50", "gwei")) * 2n; // 2x base fee for priority
+  console.log(
+    "Network base gas price:",
+    ethers.formatUnits(feeData.gasPrice ?? 0n, "gwei"),
+    "gwei"
+  );
+  console.log("Using priority gas price:", ethers.formatUnits(gasPrice, "gwei"), "gwei");
+
+  if (SNIPE_MODE === "safe") {
+    console.log("🛡️ SAFE MODE: Running checks and simulation for safer sniping");
+
+    // Safe mode: Check pool exists
+    try {
+      const slot0 = (await poolManager.getSlot0(poolKey)) as {
+        sqrtPriceX96: bigint;
+        tick: bigint;
+        protocolFee: bigint;
+        lpFee: bigint;
+      };
+      console.log("✓ Pool exists! Price:", slot0.sqrtPriceX96.toString());
+    } catch (err: unknown) {
+      console.error("✗ Pool does not exist, skipping swap", err);
+      return;
+    }
+
+    // Safe mode: Simulate swap for minOut
+    let minOut = 0n;
+    const deadline = Math.floor(Date.now() / 1000) + 180; // Longer deadline
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const result = await router.swapExactTokensForTokens.staticCall(
+        ethIn,
+        0,
+        zeroForOne,
+        poolKey,
+        hookData,
+        receiver,
+        deadline,
+        { value: ethIn }
+      );
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      const amount1Delta = result[1] as bigint;
+      const tokensOut = amount1Delta > 0 ? amount1Delta : -amount1Delta;
+      minOut = (tokensOut * 90n) / 100n; // 10% slippage
+      console.log("✓ Simulated minOut with 10% slippage:", minOut.toString());
+    } catch {
+      console.warn("⚠ Simulation failed, using minOut = 0");
+    }
+
+    const overrides = {
+      value: ethIn,
+      gasLimit: 1_500_000,
+      gasPrice,
+    };
+
+    console.log(`🛡️ SAFE SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
+
+    try {
+      const tx = (await router.swapExactTokensForTokens(
+        ethIn,
+        minOut,
+        zeroForOne,
+        poolKey,
+        hookData,
+        receiver,
+        deadline,
+        overrides
+      )) as ethers.TransactionResponse;
+
+      console.log("✓ Safe swap tx submitted:", tx.hash);
+      const receipt = await tx.wait();
+      if (receipt) {
+        console.log("✓ Safe swap confirmed! Block:", receipt.blockNumber);
+      }
+    } catch (err) {
+      console.error("✗ Safe swap failed:", err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    console.log("🚀 FAST MODE: Maximum speed sniping (high risk)");
+
+    // Validate ETH amount for fast mode
+    const ethAmount = parseFloat(ETH_AMOUNT_IN);
+    if (ethAmount > 0.1) {
+      console.warn(`⚠️ WARNING: Using ${ETH_AMOUNT_IN} ETH in FAST mode (no slippage protection)`);
+      console.warn("💡 Consider using smaller amounts (≤0.05 ETH) or SAFE mode for larger amounts");
+    }
+
+    const minOut = 0n; // Accept any amount for max speed
+    const deadline = Math.floor(Date.now() / 1000) + 60; // Short deadline
+
+    const overrides = {
+      value: ethIn,
+      gasLimit: 2_000_000, // High gas limit to avoid failures
+      gasPrice, // Dynamic priority pricing
+    };
+
+    console.log(`🚀 FAST SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
+
+    try {
+      const tx = (await router.swapExactTokensForTokens(
+        ethIn,
+        minOut,
+        zeroForOne,
+        poolKey,
+        hookData,
+        receiver,
+        deadline,
+        overrides
+      )) as ethers.TransactionResponse;
+
+      console.log("🚀 Fast swap tx submitted:", tx.hash);
+      const receipt = await tx.wait();
+      if (receipt) {
+        console.log("🎉 Fast swap confirmed! Block:", receipt.blockNumber);
+      }
+    } catch (err) {
+      console.error("✗ Fast swap failed:", err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  console.log("=== NFTStrategyLaunched END ===");
+}
 
 async function main() {
   console.log("=== Script Launch Parameters ===");
@@ -78,6 +286,7 @@ async function main() {
     PRIVATE_KEY ? `${PRIVATE_KEY.slice(0, 6)}...${PRIVATE_KEY.slice(-4)}` : "Not set"
   );
   console.log("FACTORY_ADDRESS:", FACTORY_ADDRESS);
+  console.log("RANGE_FACTORY_ADDRESS:", RANGE_FACTORY_ADDRESS);
   console.log("ROUTER_ADDRESS:", ROUTER_ADDRESS);
   console.log("POOL_MANAGER_ADDRESS:", POOL_MANAGER_ADDRESS);
   console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
@@ -114,7 +323,7 @@ async function main() {
     console.error("Error reading factory:", err);
   }
 
-  console.log("Listening for NFTStrategyLaunched events...");
+  console.log("Listening for NFTStrategyLaunched & NFTStrategyRangeLaunched events...");
 
   // Listen for launches
   void factory.on(
@@ -126,202 +335,33 @@ async function main() {
       tokenSymbol: string,
       ev: ethers.EventLog
     ) => {
-      void (async () => {
-        console.log("=== NFTStrategyLaunched ===");
-        console.log("collection:", collection);
-        console.log("token (nftStrategy):", nftStrategy);
-        console.log("name / symb:", tokenName, tokenSymbol);
-        console.log("txHash:", ev.transactionHash);
-        console.log("blockNumber:", ev.blockNumber);
-        console.log("timestamp:", new Date().toISOString());
+      console.log("NFTStrategyLaunched event received:", ev);
+      console.log("collection:", collection);
+      console.log("nftStrategy:", nftStrategy);
+      console.log("tokenName:", tokenName);
+      console.log("tokenSymbol:", tokenSymbol);
+      void handleLaunch(nftStrategy, tokenName, tokenSymbol, () => factory.hookAddress());
+    }
+  );
 
-        // debug: attach Transfer listener to token (to see incoming tokens)
-        try {
-          const token = new ethers.Contract(nftStrategy, erc20Abi, provider);
-          void token.on("Transfer", (from: string, to: string, value: bigint) => {
-            console.log(`[Token Transfer] from ${from} -> ${to} amount ${value.toString()}`);
-          });
-          console.log("✓ Token Transfer listener attached successfully");
-        } catch (err) {
-          console.error("✗ Failed to attach token Transfer listener:", err);
-          console.error("Transfer listener error details:", {
-            message: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-            nftStrategy,
-          });
-        }
-
-        // Build deterministic PoolKey as in factory
-        console.log("--- Building PoolKey ---");
-        let hooks: string;
-        try {
-          hooks = HOOK_OVERRIDE || ((await factory.hookAddress()) as string);
-          console.log("✓ Hook address resolved:", hooks);
-        } catch (err) {
-          console.error("✗ Failed to get hook address:", err);
-          console.error("Hook address error details:", {
-            message: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-            HOOK_OVERRIDE,
-            factoryAddress: FACTORY_ADDRESS,
-          });
-          return;
-        }
-
-        // PoolKey construction for ETH -> Token sniping
-        // Since we're always trading ETH (0x0) -> Token, and 0x0 < any token address:
-        // currency0 = ETH, currency1 = Token, zeroForOne = true
-        console.log("--- Building PoolKey for ETH -> Token ---");
-        const currency0 = ethers.ZeroAddress; // ETH (always currency0 since 0x0 < any address)
-        const currency1 = nftStrategy; // Token (always currency1)
-        const fee = 0; // uint24
-        const tickSpacing = 60; // int24
-
-        const poolKey = {
-          currency0,
-          currency1,
-          fee,
-          tickSpacing,
-          hooks,
-        };
-
-        console.log("✓ PoolKey built:", poolKey);
-
-        // Prepare basic swap parameters
-        const ethIn = ethers.parseEther(ETH_AMOUNT_IN);
-        const zeroForOne = true; // Always true for ETH -> Token
-        const hookData = "0x";
-        const receiver = wallet.address;
-
-        // Get dynamic gas pricing
-        console.log("--- Getting Network Fee Data ---");
-        const feeData = await provider.getFeeData();
-        const gasPrice = (feeData.gasPrice ?? ethers.parseUnits("50", "gwei")) * 2n; // 2x base fee for priority
-        console.log(
-          "Network base gas price:",
-          ethers.formatUnits(feeData.gasPrice ?? 0n, "gwei"),
-          "gwei"
-        );
-        console.log("Using priority gas price:", ethers.formatUnits(gasPrice, "gwei"), "gwei");
-
-        if (SNIPE_MODE === "safe") {
-          console.log("🛡️ SAFE MODE: Running checks and simulation for safer sniping");
-
-          // Safe mode: Check pool exists
-          try {
-            const slot0 = (await poolManager.getSlot0(poolKey)) as {
-              sqrtPriceX96: bigint;
-              tick: bigint;
-              protocolFee: bigint;
-              lpFee: bigint;
-            };
-            console.log("✓ Pool exists! Price:", slot0.sqrtPriceX96.toString());
-          } catch (err: unknown) {
-            console.error("✗ Pool does not exist, skipping swap", err);
-            return;
-          }
-
-          // Safe mode: Simulate swap for minOut
-          let minOut = 0n;
-          const deadline = Math.floor(Date.now() / 1000) + 180; // Longer deadline
-          try {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-            const result = await router.swapExactTokensForTokens.staticCall(
-              ethIn,
-              0,
-              zeroForOne,
-              poolKey,
-              hookData,
-              receiver,
-              deadline,
-              { value: ethIn }
-            );
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-            const amount1Delta = result[1] as bigint;
-            const tokensOut = amount1Delta > 0 ? amount1Delta : -amount1Delta;
-            minOut = (tokensOut * 90n) / 100n; // 10% slippage
-            console.log("✓ Simulated minOut with 10% slippage:", minOut.toString());
-          } catch {
-            console.warn("⚠ Simulation failed, using minOut = 0");
-          }
-
-          const overrides = {
-            value: ethIn,
-            gasLimit: 1_500_000,
-            gasPrice,
-          };
-
-          console.log(`🛡️ SAFE SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
-
-          try {
-            const tx = (await router.swapExactTokensForTokens(
-              ethIn,
-              minOut,
-              zeroForOne,
-              poolKey,
-              hookData,
-              receiver,
-              deadline,
-              overrides
-            )) as ethers.TransactionResponse;
-
-            console.log("✓ Safe swap tx submitted:", tx.hash);
-            const receipt = await tx.wait();
-            if (receipt) {
-              console.log("✓ Safe swap confirmed! Block:", receipt.blockNumber);
-            }
-          } catch (err) {
-            console.error("✗ Safe swap failed:", err instanceof Error ? err.message : String(err));
-          }
-        } else {
-          console.log("🚀 FAST MODE: Maximum speed sniping (high risk)");
-
-          // Validate ETH amount for fast mode
-          const ethAmount = parseFloat(ETH_AMOUNT_IN);
-          if (ethAmount > 0.1) {
-            console.warn(
-              `⚠️ WARNING: Using ${ETH_AMOUNT_IN} ETH in FAST mode (no slippage protection)`
-            );
-            console.warn(
-              "💡 Consider using smaller amounts (≤0.05 ETH) or SAFE mode for larger amounts"
-            );
-          }
-
-          const minOut = 0n; // Accept any amount for max speed
-          const deadline = Math.floor(Date.now() / 1000) + 60; // Short deadline
-
-          const overrides = {
-            value: ethIn,
-            gasLimit: 2_000_000, // High gas limit to avoid failures
-            gasPrice, // Dynamic priority pricing
-          };
-
-          console.log(`🚀 FAST SNIPING: ${ETH_AMOUNT_IN} ETH -> ${nftStrategy}`);
-
-          try {
-            const tx = (await router.swapExactTokensForTokens(
-              ethIn,
-              minOut,
-              zeroForOne,
-              poolKey,
-              hookData,
-              receiver,
-              deadline,
-              overrides
-            )) as ethers.TransactionResponse;
-
-            console.log("🚀 Fast swap tx submitted:", tx.hash);
-            const receipt = await tx.wait();
-            if (receipt) {
-              console.log("🎉 Fast swap confirmed! Block:", receipt.blockNumber);
-            }
-          } catch (err) {
-            console.error("✗ Fast swap failed:", err instanceof Error ? err.message : String(err));
-          }
-        }
-
-        console.log("=== NFTStrategyLaunched END ===");
-      })();
+  void rangeFactory.on(
+    "NFTStrategyRangeLaunched",
+    (
+      collection: string,
+      nftStrategy: string,
+      lowTokenId: bigint,
+      highTokenId: bigint,
+      tokenName: string,
+      tokenSymbol: string,
+      ev: ethers.EventLog
+    ) => {
+      console.log("NFTStrategyRangeLaunched event received:", ev);
+      console.log(`Range: ${lowTokenId} - ${highTokenId}`);
+      console.log("collection:", collection);
+      console.log("nftStrategy:", nftStrategy);
+      console.log("tokenName:", tokenName);
+      console.log("tokenSymbol:", tokenSymbol);
+      void handleLaunch(nftStrategy, tokenName, tokenSymbol, () => rangeFactory.hookAddress());
     }
   );
 
