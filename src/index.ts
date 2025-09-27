@@ -60,7 +60,10 @@ const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, wallet); // Reserv
 async function main() {
   console.log("=== Script Launch Parameters ===");
   console.log("RPC_WSS:", RPC_WSS);
-  console.log("PRIVATE_KEY:", PRIVATE_KEY ? `${PRIVATE_KEY.slice(0, 6)}...${PRIVATE_KEY.slice(-4)}` : "Not set");
+  console.log(
+    "PRIVATE_KEY:",
+    PRIVATE_KEY ? `${PRIVATE_KEY.slice(0, 6)}...${PRIVATE_KEY.slice(-4)}` : "Not set"
+  );
   console.log("FACTORY_ADDRESS:", FACTORY_ADDRESS);
   console.log("ROUTER_ADDRESS:", ROUTER_ADDRESS);
   console.log("HOOK_OVERRIDE:", HOOK_OVERRIDE || "Not set");
@@ -114,6 +117,8 @@ async function main() {
         console.log("token (nftStrategy):", nftStrategy);
         console.log("name / symb:", tokenName, tokenSymbol);
         console.log("txHash:", ev.transactionHash);
+        console.log("blockNumber:", ev.blockNumber);
+        console.log("timestamp:", new Date().toISOString());
 
         // debug: attach Transfer listener to token (to see incoming tokens)
         try {
@@ -121,17 +126,38 @@ async function main() {
           void token.on("Transfer", (from: string, to: string, value: bigint) => {
             console.log(`[Token Transfer] from ${from} -> ${to} amount ${value.toString()}`);
           });
+          console.log("✓ Token Transfer listener attached successfully");
         } catch (err) {
-          console.warn("Could not attach token Transfer listener:", err);
+          console.error("✗ Failed to attach token Transfer listener:", err);
+          console.error("Transfer listener error details:", {
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+            nftStrategy,
+          });
         }
 
         // Build deterministic PoolKey as in factory
+        console.log("--- Building PoolKey ---");
+        let hooks: string;
+        try {
+          hooks = HOOK_OVERRIDE || ((await factory.hookAddress()) as string);
+          console.log("✓ Hook address resolved:", hooks);
+        } catch (err) {
+          console.error("✗ Failed to get hook address:", err);
+          console.error("Hook address error details:", {
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+            HOOK_OVERRIDE,
+            factoryAddress: FACTORY_ADDRESS,
+          });
+          return;
+        }
+
         // PoolKey(currency0, currency1, fee, tickSpacing, hooks)
         const currency0 = ethers.ZeroAddress; // ETH
         const currency1 = nftStrategy;
         const fee = 0; // uint24
         const tickSpacing = 60; // int24
-        const hooks = HOOK_OVERRIDE || ((await factory.hookAddress()) as string);
 
         const poolKey = {
           currency0,
@@ -141,9 +167,10 @@ async function main() {
           hooks,
         };
 
-        console.log("PoolKey:", poolKey);
+        console.log("✓ PoolKey built:", poolKey);
 
-        // Prepare swap
+        // Prepare swap parameters
+        console.log("--- Preparing Swap Parameters ---");
         const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
         const minOut = 0; // set to 0 for max agressivity; you can compute via quoter for safety
         const exactIn = true;
@@ -158,10 +185,62 @@ async function main() {
           // gasPrice: ethers.parseUnits("200", "gwei"), // optional: set explicit gas price if legacy RPC
         };
 
+        console.log("Swap parameters:", {
+          ethIn: ethIn.toString(),
+          ethInEther: ETH_AMOUNT_IN,
+          minOut,
+          exactIn,
+          recipient,
+          deadline,
+          overrides,
+          routerAddress: ROUTER_ADDRESS,
+        });
+
+        // Check wallet balance before swap
+        try {
+          const balance = await provider.getBalance(wallet.address);
+          console.log("Wallet ETH balance:", ethers.formatEther(balance), "ETH");
+          if (balance < ethIn) {
+            console.error("✗ Insufficient ETH balance!");
+            console.error("Required:", ethers.formatEther(ethIn), "ETH");
+            console.error("Available:", ethers.formatEther(balance), "ETH");
+            return;
+          }
+        } catch (err) {
+          console.error("✗ Failed to check wallet balance:", err);
+          console.error("Balance check error details:", {
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+            walletAddress: wallet.address,
+          });
+        }
+
+        console.log(`--- Executing Swap ---`);
         console.log(
           `Attempting swap: send ${ETH_AMOUNT_IN} ETH -> token ${nftStrategy} via router ${ROUTER_ADDRESS}`
         );
+
         try {
+          // Get gas estimate first
+          try {
+            const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
+              ethIn,
+              minOut,
+              exactIn,
+              poolKey,
+              hookData,
+              recipient,
+              deadline,
+              overrides
+            );
+            console.log("✓ Gas estimate:", gasEstimate.toString());
+          } catch (gasErr) {
+            console.warn(
+              "⚠ Gas estimation failed (proceeding anyway):",
+              gasErr instanceof Error ? gasErr.message : String(gasErr)
+            );
+          }
+
           const tx = (await router.swapExactTokensForTokens(
             ethIn,
             minOut,
@@ -172,15 +251,78 @@ async function main() {
             deadline,
             overrides
           )) as ethers.TransactionResponse;
-          console.log("Swap tx submitted:", tx.hash);
+
+          console.log("✓ Swap tx submitted:", tx.hash);
+          console.log("Transaction details:", {
+            hash: tx.hash,
+            from: tx.from,
+            to: tx.to,
+            value: tx.value?.toString(),
+            gasLimit: tx.gasLimit?.toString(),
+            gasPrice: tx.gasPrice?.toString(),
+            nonce: tx.nonce,
+          });
+
+          console.log("Waiting for transaction confirmation...");
           const receipt = await tx.wait();
           if (!receipt) {
-            console.error("Transaction receipt is null");
+            console.error("✗ Transaction receipt is null");
             return;
           }
-          console.log("Swap confirmed. Block:", receipt.blockNumber);
+
+          console.log("✓ Swap confirmed!");
+          console.log("Receipt details:", {
+            blockNumber: receipt.blockNumber,
+            blockHash: receipt.blockHash,
+            gasUsed: receipt.gasUsed?.toString(),
+            status: receipt.status,
+            logs: receipt.logs.length,
+          });
+
+          // Log any events in the receipt
+          if (receipt.logs.length > 0) {
+            console.log("Transaction logs:");
+            receipt.logs.forEach((log, index) => {
+              console.log(`Log ${index}:`, {
+                address: log.address,
+                topics: log.topics,
+                data: log.data,
+              });
+            });
+          }
         } catch (err) {
-          console.error("Swap failed:", err instanceof Error ? err.message : String(err));
+          console.error("✗ Swap failed!");
+          console.error("Error message:", err instanceof Error ? err.message : String(err));
+          console.error("Error stack:", err instanceof Error ? err.stack : undefined);
+
+          // Log additional error context
+          if (err instanceof Error) {
+            const errorDetails: Record<string, unknown> = {
+              name: err.name,
+              message: err.message,
+            };
+
+            if ("code" in err) errorDetails.code = err.code;
+            if ("reason" in err) errorDetails.reason = err.reason;
+            if ("transaction" in err) errorDetails.transaction = err.transaction;
+            if ("receipt" in err) errorDetails.receipt = err.receipt;
+
+            console.error("Error details:", errorDetails);
+          }
+
+          console.error("Swap context when error occurred:", {
+            ethIn: ethIn.toString(),
+            minOut,
+            exactIn,
+            poolKey,
+            hookData,
+            recipient,
+            deadline,
+            overrides,
+            routerAddress: ROUTER_ADDRESS,
+            walletAddress: wallet.address,
+            timestamp: new Date().toISOString(),
+          });
         }
 
         console.log("=== NFTStrategyLaunched END ===");
