@@ -24,11 +24,10 @@ const factoryAbi = [
   "function listOfRouters(address) view returns (bool)",
 ];
 
-// Router ABI (minimal) — signature used in factory:
-// swapExactTokensForTokens(uint256 amountIn, uint256 minAmountOut, bool exactIn, (address,address,uint24,int24,address) key, bytes hookData, address recipient, uint256 deadline) payable
+// Router ABI matching the actual contract interface
 const routerAbi = [
-  "function swapExactTokensForTokens(uint256 amountIn, uint256 minAmountOut, bool exactIn, tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes hookData, address recipient, uint256 deadline) payable returns (uint256 amountOut)",
-]; // Reserved for future swap implementation
+  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, bool zeroForOne, tuple(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes hookData, address receiver, uint256 deadline) payable returns (tuple(int128 amount0, int128 amount1))",
+];
 
 // ERC20 minimal for Transfer event
 const erc20Abi = [
@@ -173,9 +172,9 @@ async function main() {
         console.log("--- Preparing Swap Parameters ---");
         const ethIn = ethers.parseEther(ETH_AMOUNT_IN); // amount of ETH to send
         const minOut = 0; // set to 0 for max agressivity; you can compute via quoter for safety
-        const exactIn = true;
+        const zeroForOne = true; // ETH (currency0) -> token (currency1)
         const hookData = "0x";
-        const recipient = wallet.address;
+        const receiver = wallet.address;
         const deadline = Math.floor(Date.now() / 1000) + 60; // 60 sec
 
         // Gas params - tune as needed
@@ -189,8 +188,8 @@ async function main() {
           ethIn: ethIn.toString(),
           ethInEther: ETH_AMOUNT_IN,
           minOut,
-          exactIn,
-          recipient,
+          zeroForOne,
+          receiver,
           deadline,
           overrides,
           routerAddress: ROUTER_ADDRESS,
@@ -226,10 +225,10 @@ async function main() {
             const gasEstimate = await router.swapExactTokensForTokens.estimateGas(
               ethIn,
               minOut,
-              exactIn,
+              zeroForOne,
               poolKey,
               hookData,
-              recipient,
+              receiver,
               deadline,
               overrides
             );
@@ -244,10 +243,10 @@ async function main() {
           const tx = (await router.swapExactTokensForTokens(
             ethIn,
             minOut,
-            exactIn,
+            zeroForOne,
             poolKey,
             hookData,
-            recipient,
+            receiver,
             deadline,
             overrides
           )) as ethers.TransactionResponse;
@@ -313,10 +312,10 @@ async function main() {
           console.error("Swap context when error occurred:", {
             ethIn: ethIn.toString(),
             minOut,
-            exactIn,
+            zeroForOne,
             poolKey,
             hookData,
-            recipient,
+            receiver,
             deadline,
             overrides,
             routerAddress: ROUTER_ADDRESS,
